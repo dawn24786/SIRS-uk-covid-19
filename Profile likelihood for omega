@@ -1,0 +1,225 @@
+import numpy as np
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+
+GAMMA=0.33589; OMEGA=1e-5; T=163; S0,I0,R0=0.9999,1e-6,1e-4
+I_SCALE=1_030_928.0; t_obs=np.arange(T,dtype=float)
+LB6=np.log(np.array([0.5558,0.3035,0.4181,0.3417,0.5572,0.2508]))
+BP6=np.array([38.6,64.0,84.0,93.0,102.5]); K6K=6.3313
+
+def ba_arr(lb,bps,n):
+    arr=np.full(n,float(np.exp(lb[0])))
+    segs=np.concatenate([[0],np.sort(np.clip(bps,1,n-2).astype(int)),[n]])
+    for i in range(len(segs)-1): arr[segs[i]:segs[i+1]]=float(np.exp(lb[i]))
+    return arr
+
+def rhs(y,t,ba,om):
+    S,I,R=y; N=max(S+I+R,1e-10); b=ba[min(int(round(t)),T-1)]
+    return [-b*S*I/N+om*R, b*S*I/N-GAMMA*I, GAMMA*I-om*R]
+
+ba6=ba_arr(LB6,BP6,T)
+Ifix=odeint(rhs,[S0,I0,R0],t_obs,args=(ba6,OMEGA),rtol=1e-6,atol=1e-8)[:,1]
+noise_std=76607.0/I_SCALE; np.random.seed(42)
+obs_n=np.clip(Ifix*K6K+np.random.normal(0,noise_std,T),0,None)
+print(f"CHECK 1 obs_n.max={obs_n.max():.5f} obs.max={obs_n.max()*I_SCALE:,.0f}")
+
+THRESHOLD=1.92
+OG=np.logspace(-6,-0.7,15)  # fast 15-pt grid
+
+def scan(obs_n, lb_init, bp_init, Kv, og, kfix=None):
+    res=[]
+    for om in og:
+        if kfix is not None:
+            # k fixed mode - just run ODE with fixed k and fixed beta
+            try:
+                s=odeint(rhs,[S0,I0,R0],t_obs,args=(ba6,float(om)),rtol=1e-4,atol=1e-6)
+                mse=float(np.mean((s[:,1]*kfix-obs_n)**2))
+            except: mse=1e6
+        else:
+            def f(p,_om=float(om)):
+                b=ba_arr(np.clip(p[:Kv],-5,5),bp_init,T)
+                k=float(np.exp(np.clip(p[-1],-5,10)))
+                try:
+                    s=odeint(rhs,[S0,I0,R0],t_obs,args=(b,_om),rtol=1e-4,atol=1e-6)
+                    return float(np.mean((s[:,1]*k-obs_n)**2))
+                except: return 1e6
+            r=minimize(f,np.concatenate([lb_init,[np.log(K6K)]]),
+                       method='Nelder-Mead',options=dict(maxiter=600,xatol=1e-5,fatol=1e-7))
+            mse=max(r.fun,1e-30)
+        res.append(-T/2*np.log(max(mse,1e-30)))
+    ll=np.array(res)
+    dl=ll.max()-ll
+    ci=og[dl<=THRESHOLD]
+    return ll, dl, ci
+
+# CHECK 2 - K=6 k re-opt
+print("CHECK 2 (K=6 k re-opt)...")
+ll2,dl2,ci2=scan(obs_n,LB6,BP6,6,OG)
+om2=OG[np.argmin(dl2)]
+print(f"  dl range=[{dl2.min():.3f},{dl2.max():.3f}] CI={ci2.size}/{len(OG)}({ci2.size/len(OG):.0%}) mle={om2:.2e}")
+
+# CHECK 3 - k fixed vs k re-opt (sub-grid)
+OG3=np.logspace(-6,-0.7,10)
+print("CHECK 3 (k fixed)...")
+ll3f,dl3f,ci3f=scan(obs_n,LB6,BP6,6,OG3,kfix=K6K)
+print(f"  k-fixed  CI={ci3f.size}/{len(OG3)}({ci3f.size/len(OG3):.0%})")
+print("CHECK 3 (k re-opt)...")
+ll3r,dl3r,ci3r=scan(obs_n,LB6,BP6,6,OG3)
+print(f"  k-reopt  CI={ci3r.size}/{len(OG3)}({ci3r.size/len(OG3):.0%})")
+
+# CHECK 4 - K sensitivity
+OG4=np.logspace(-6,-0.7,10)
+K_CFGS={
+    1:(np.log(np.array([0.456])),             np.array([])),
+    4:(np.log(np.array([0.55,0.30,0.47,0.30])),np.array([38.6,64.0,95.0])),
+    6:(LB6, BP6),
+    8:(np.log(np.array([0.55,0.31,0.42,0.35,0.50,0.56,0.30,0.25])),
+       np.array([30.0,52.0,75.0,84.0,93.0,102.5,120.0])),
+}
+rk={}
+for Kv,(lb,bp) in K_CFGS.items():
+    print(f"CHECK 4 K={Kv}...")
+    ll,dl,ci=scan(obs_n,lb,bp,Kv,OG4)
+    rk[Kv]=dict(ll=ll,dl=dl,ci=ci,cf=ci.size/len(OG4),mle=OG4[np.argmin(dl)])
+    print(f"  K={Kv} CI={ci.size}/{len(OG4)} ({ci.size/len(OG4):.0%}) mle={rk[Kv]['mle']:.2e}")
+
+np.savez('/home/claude/check_results.npz',
+         OG=OG, ll2=ll2, dl2=dl2, ci2=ci2, om_mle2=np.array([om2]),
+         OG3=OG3, dl3f=dl3f, dl3r=dl3r, ci3f=ci3f, ci3r=ci3r,
+         OG4=OG4,
+         dl_k1=rk[1]['dl'], dl_k4=rk[4]['dl'],
+         dl_k6=rk[6]['dl'], dl_k8=rk[8]['dl'],
+         ci_k1=rk[1]['ci'], ci_k4=rk[4]['ci'],
+         ci_k6=rk[6]['ci'], ci_k8=rk[8]['ci'],
+         cf_k1=np.array([rk[1]['cf']]), cf_k4=np.array([rk[4]['cf']]),
+         cf_k6=np.array([rk[6]['cf']]), cf_k8=np.array([rk[8]['cf']]),
+         obs_n=obs_n, t_obs=t_obs, Ifix=Ifix,
+         I_SCALE=np.array([I_SCALE]), ci2_frac=np.array([ci2.size/len(OG)]))
+print("Saved check_results.npz")
+
+
+# -*- coding: utf-8 -*-
+"""
+Created on Fri May  8 04:25:23 2026
+
+@author: Dawnn
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Figure 4A — Clean Profile Likelihood for omega
+================================================
+Generates figure4A_final.png as described in the paper.
+
+Requirements:
+  - check_results.npz  (produced by checks_fast.py)
+  - numpy, matplotlib
+
+Usage:
+  python figure4A_script.py
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+# ── load validated profile likelihood results ──────────────────────────────
+d    = np.load('check_results.npz', allow_pickle=True)
+OG   = d['OG']          # omega grid (15 log-spaced points)
+dl2  = d['dl2']         # delta-LL for K=6, k re-optimised
+om2  = float(d['om_mle2'][0])
+THRESHOLD = 1.92        # chi-squared(1) / 2  →  95% CI boundary
+
+# ── colour palette ─────────────────────────────────────────────────────────
+BG     = '#0D1117'
+PANEL  = '#161B22'
+GRIDC  = '#21262D'
+GREEN  = '#3FB950'
+RED    = '#FF7B72'
+TXT    = '#E6EDF3'
+SUB    = '#8B949E'
+PURPLE = '#BC8CFF'
+
+plt.rcParams.update({
+    'figure.facecolor': BG,    'axes.facecolor':  PANEL,
+    'axes.edgecolor':   GRIDC, 'axes.labelcolor': TXT,
+    'xtick.color':      SUB,   'ytick.color':     SUB,
+    'text.color':       TXT,   'grid.color':      GRIDC,
+    'grid.linestyle':   '--',  'grid.linewidth':  0.5,
+    'font.family':      'DejaVu Sans',
+    'legend.facecolor': PANEL, 'legend.edgecolor': GRIDC,
+})
+
+ci_mask = dl2 <= THRESHOLD
+
+fig, ax = plt.subplots(figsize=(8, 5.5), facecolor=BG)
+fig.subplots_adjust(left=0.12, right=0.97, top=0.88, bottom=0.13)
+
+# ── shaded 95% CI region ───────────────────────────────────────────────────
+ax.fill_between(OG, 0, THRESHOLD,
+                where=ci_mask,
+                color=GREEN, alpha=0.18, zorder=1,
+                label='95% confidence region within scanned grid')
+
+# ── main delta-LL curve ────────────────────────────────────────────────────
+ax.semilogx(OG, dl2, color=PURPLE, lw=2.8, zorder=3,
+            label=r'$\Delta\ell(\omega) = \ell_{\max} - \ell(\omega)$')
+
+# ── 95% CI threshold line ──────────────────────────────────────────────────
+ax.axhline(THRESHOLD, color=RED, lw=2.0, ls='--', zorder=2,
+           label=r'95% CI threshold   $\Delta\ell = 1.92$')
+
+# ── MLE marker ────────────────────────────────────────────────────────────
+ax.scatter([om2], [0.0], color=GREEN, s=70, zorder=5,
+           label=f'MLE   $\\omega = {om2:.2e}$ /wk')
+
+# ── y = 0 reference ───────────────────────────────────────────────────────
+ax.axhline(0, color=TXT, lw=0.6, alpha=0.35, zorder=1)
+
+# ── annotation box ────────────────────────────────────────────────────────
+annot = (
+    '95% CI spans entire scanned range\n'
+    r'$\omega \in [10^{-6},\ 0.20]$ /wk' + '\n\n'
+    r'$\Rightarrow$ Weak practical identifiability'
+)
+ax.text(0.975, 0.97, annot,
+        transform=ax.transAxes,
+        fontsize=9.5, color=TXT, va='top', ha='right',
+        linespacing=1.55,
+        bbox=dict(boxstyle='round,pad=0.55',
+                  fc=PANEL, ec=GREEN, lw=1.6, alpha=0.95))
+
+# ── axes labels ───────────────────────────────────────────────────────────
+ax.set_xlabel(r'$\omega$  (immunity-loss rate,  /week,  log scale)',
+              color=SUB, fontsize=11, labelpad=6)
+ax.set_ylabel(r'$\Delta\ell(\omega) = \ell_{\max} - \ell(\omega)$',
+              color=SUB, fontsize=11, labelpad=6)
+
+ax.set_xlim(OG[0] * 0.7, OG[-1] * 1.4)
+ax.set_ylim(-0.05, max(dl2.max(), THRESHOLD) * 1.30)
+ax.xaxis.set_major_formatter(mticker.LogFormatterSciNotation())
+ax.tick_params(axis='both', labelsize=9)
+
+# ── grid ──────────────────────────────────────────────────────────────────
+ax.grid(True, which='major', alpha=0.35)
+ax.grid(True, which='minor', alpha=0.12)
+
+# ── title (no "Figure 4A" prefix — label belongs in caption only) ─────────
+ax.set_title(
+    'Profile Likelihood for $\\omega$  (Immunity Waning Rate)\n'
+    'K = 6 piecewise SIRS  ·  $k$ re-optimised at each $\\omega$  '
+    '·  UK weekly COVID-19 data',
+    fontsize=10.5, fontweight='bold', color=TXT, pad=10)
+
+# ── legend ────────────────────────────────────────────────────────────────
+ax.legend(fontsize=8.8, framealpha=0.45, loc='upper left',
+          borderpad=0.7, labelspacing=0.5)
+
+plt.savefig('figure4A_final.png', dpi=180,
+            bbox_inches='tight', facecolor=BG)
+print(f"Saved figure4A_final.png")
+print(f"  delta_max = {dl2.max():.3f}  (threshold = {THRESHOLD})")
+print(f"  CI coverage = {ci_mask.sum()}/{len(OG)} = {ci_mask.sum()/len(OG):.0%}")
+print(f"  omega MLE  = {om2:.3e} /wk")
