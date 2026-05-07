@@ -28,9 +28,9 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import savgol_filter
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-RAW_CSV   = "/mnt/user-data/uploads/time_series_covid19_confirmed_global__1_.csv"
-CLEAN_CSV = "/mnt/user-data/outputs/uk_weekly_cases_clean.csv"
-CHART_DIR = "/mnt/user-data/outputs/"
+RAW_CSV   = "C:/Users/Dawnn/Desktop/sirs/uk/time_series_covid19_confirmed_global (1).csv"
+CLEAN_CSV = "C:/Users/Dawnn/Desktop/sirs/uk/outputs/uk_weekly_cases_clean.csv"
+CHART_DIR = "C:/Users/Dawnn/Desktop/sirs/uk/outputs/"
 
 import os
 os.makedirs(CHART_DIR, exist_ok=True)
