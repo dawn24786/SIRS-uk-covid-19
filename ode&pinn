@@ -1,0 +1,1026 @@
+"""
+UK COVID-19 SIRS Modeling Full Pipeline
+========================================
+Steps 1–9  : Data cleaning, aggregation, smoothing, visualisation
+Steps 10–12: ODE baseline + PINN (constant β) + forward simulation
+Step  13   : Piecewise β(t) with K = 4, 6, 8 + model selection
+
+Data source : JHU time_series_covid19_confirmed_global.csv
+Output      : uk_weekly_cases_clean.csv  +  all PNG charts
+Confirmed   : T = 163 weeks (2020-01-27 → 2023-03-06)
+
+Dependencies: numpy, pandas, scipy, matplotlib
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+import warnings
+from scipy.integrate import odeint
+from scipy.optimize import minimize, differential_evolution
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+from scipy.stats import linregress
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+RAW_DATA = "C:/Users/Dawnn/Desktop/sirs/uk/time_series_covid19_confirmed_global (1).csv"
+OUT_DIR  = "C:/Users/Dawnn/Desktop/sirs/uk/outputs"
+N_UK     = 67_000_000          # UK population (used for per-100k columns)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLOUR PALETTE & MATPLOTLIB STYLE
+# ─────────────────────────────────────────────────────────────────────────────
+C = dict(
+    bg    = "#0D1117", panel = "#161B22", grid  = "#21262D",
+    c1    = "#58A6FF", c2    = "#F0883E", c3    = "#3FB950",
+    c4    = "#D29922", c5    = "#BC8CFF", c6    = "#FF7B72",
+    c7    = "#39D2D2", c8    = "#F78166", txt   = "#E6EDF3",
+    sub   = "#8B949E",
+)
+
+plt.rcParams.update({
+    "figure.facecolor" : C["bg"],   "axes.facecolor"  : C["panel"],
+    "axes.edgecolor"   : C["grid"], "axes.labelcolor" : C["txt"],
+    "xtick.color"      : C["sub"],  "ytick.color"     : C["sub"],
+    "text.color"       : C["txt"],  "grid.color"      : C["grid"],
+    "grid.linestyle"   : "--",      "grid.linewidth"  : 0.5,
+    "font.family"      : "DejaVu Sans",
+})
+
+def fmtk(x, _ = None):
+    if x >= 1e6: return f"{x/1e6:.1f}M"
+    if x >= 1e3: return f"{x/1e3:.0f}K"
+    return f"{x:.0f}"
+
+def style_ax(ax, title, xl="Week index", yl="Weekly Cases"):
+    ax.set_title(title, fontsize=11, fontweight="bold", color=C["txt"], pad=7)
+    ax.set_xlabel(xl, color=C["sub"], fontsize=9)
+    ax.set_ylabel(yl, color=C["sub"], fontsize=9)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(fmtk))
+    ax.grid(True, alpha=0.35)
+
+SAVE = lambda name: (
+    plt.savefig(f"{OUT_DIR}/{name}", dpi=150, bbox_inches="tight"),
+    plt.close(),
+    print(f"  ✓  {name}"),
+)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — DATA CLEANING  (Steps 1 – 7)
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("STAGE 1 — DATA CLEANING")
+print("═"*65)
+
+# ── Step 1-2 : Load raw JHU data, identify columns ───────────────────────────
+print("\nStep 1-2: Loading JHU global confirmed cases …")
+df_raw  = pd.read_csv(RAW_DATA)
+date_cols = [c for c in df_raw.columns
+             if c not in ["Province/State", "Country/Region", "Lat", "Long"]]
+print(f"  Rows: {len(df_raw)}  |  Date columns: {len(date_cols)}"
+      f"  ({date_cols[0]} → {date_cols[-1]})")
+print(f"  Unique countries: {df_raw['Country/Region'].nunique()}")
+
+# ── Step 3 : Filter United Kingdom ───────────────────────────────────────────
+print("\nStep 3: Filtering United Kingdom …")
+uk_df  = df_raw[df_raw["Country/Region"] == "United Kingdom"].copy()
+print(f"  UK sub-region rows found: {len(uk_df)}")
+print(f"  Provinces: {uk_df['Province/State'].tolist()}")
+
+# Aggregate all sub-regions → national cumulative series
+uk_cum = uk_df[date_cols].sum(axis=0)
+uk_cum.index = pd.to_datetime(uk_cum.index, format="%m/%d/%y")
+uk_cum = uk_cum.sort_index()
+print(f"  Cumulative range: {uk_cum.index[0].date()} → {uk_cum.index[-1].date()}")
+print(f"  Final cumulative count: {uk_cum.iloc[-1]:,.0f}")
+
+# ── Step 4 : Cumulative → daily new cases; fix negatives ─────────────────────
+print("\nStep 4: Converting cumulative → daily new cases …")
+uk_daily = uk_cum.diff().fillna(0)
+neg_days = (uk_daily < 0).sum()
+print(f"  Negative-value days before correction: {neg_days}")
+uk_daily = uk_daily.clip(lower=0)
+
+uk_daily_df = pd.DataFrame(
+    {"daily_cases": uk_daily.values}, index=uk_cum.index
+)
+print(f"  Max daily cases: {uk_daily.max():,.0f}"
+      f"  on {uk_daily.idxmax().date()}")
+
+# ── Step 5 : Daily → weekly (Monday anchor) ──────────────────────────────────
+print("\nStep 5: Resampling daily → weekly (W-MON) …")
+uk_weekly = (uk_daily_df
+             .resample("W-MON", label="left", closed="left")
+             .sum())
+uk_weekly.index.name = "week_start"
+uk_weekly.columns    = ["uk_cases_raw"]
+
+# Drop first all-zero week → 163 weeks
+uk_weekly = uk_weekly.iloc[1:].copy().reset_index()
+uk_weekly["week_index"] = np.arange(len(uk_weekly))
+print(f"  Weeks: {len(uk_weekly)}")
+print(f"  Date range: {uk_weekly['week_start'].iloc[0].date()}"
+      f" → {uk_weekly['week_start'].iloc[-1].date()}")
+assert len(uk_weekly) == 163, f"Expected 163 weeks, got {len(uk_weekly)}"
+
+# ── Step 6 : Smoothing ────────────────────────────────────────────────────────
+print("\nStep 6: Smoothing weekly cases …")
+raw_arr = uk_weekly["uk_cases_raw"].values.astype(float)
+
+# 7-point centred rolling mean  (matches paper)
+smooth_arr = (pd.Series(raw_arr)
+              .rolling(7, center=True, min_periods=1)
+              .mean()
+              .values)
+uk_weekly["uk_cases_smooth"] = smooth_arr
+
+# Also keep Gaussian-smoothed version for reference
+uk_weekly["uk_cases_gaussian"] = gaussian_filter1d(raw_arr, sigma=1.5)
+
+# Per-100k columns
+uk_weekly["uk_cases_raw_per100k"]    = raw_arr    / N_UK * 100_000
+uk_weekly["uk_cases_smooth_per100k"] = smooth_arr / N_UK * 100_000
+
+# 0-1 scaled (for PINN)
+uk_weekly["uk_cases_scaled"] = raw_arr / raw_arr.max()
+
+print(f"  Max raw   : {raw_arr.max():,.0f}")
+print(f"  Max smooth: {smooth_arr.max():,.0f}")
+
+# ── Step 7 : Save PINN-ready CSV ─────────────────────────────────────────────
+out_csv = f"{OUT_DIR}/uk_weekly_cases_clean.csv"
+uk_weekly.to_csv(out_csv, index=False)
+print(f"\nStep 7: Saved → {out_csv}")
+print(f"  Columns: {list(uk_weekly.columns)}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — VISUALISATION  (Steps 8 – 9)
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("STAGE 2 — VISUALISATION  (Steps 8-9)")
+print("═"*65)
+
+t_obs     = uk_weekly["week_index"].values.astype(float)   # 0..162
+obs_raw   = raw_arr
+obs_smooth= smooth_arr
+T         = len(t_obs)   # 163
+
+# ── Summary statistics (Step 9) ───────────────────────────────────────────────
+n_weeks    = T
+max_val    = obs_raw.max()
+max_wk     = uk_weekly.loc[obs_raw.argmax(), "week_start"]
+mean_val   = obs_raw.mean()
+median_val = np.median(obs_raw)
+std_val    = obs_raw.std()
+
+mid   = T // 2
+slope_1st, icpt_1st, *_ = linregress(t_obs[:mid],  obs_smooth[:mid])
+slope_2nd, icpt_2nd, *_ = linregress(t_obs[mid:],  obs_smooth[mid:])
+
+print(f"\nStep 9 — Summary Statistics:")
+print(f"  Total weeks    : {n_weeks}")
+print(f"  Date range     : {uk_weekly['week_start'].iloc[0].date()}"
+      f" → {uk_weekly['week_start'].iloc[-1].date()}")
+print(f"  Maximum (raw)  : {max_val:,.0f}  (week of {max_wk.date()})")
+print(f"  Mean/week      : {mean_val:,.0f}")
+print(f"  Median/week    : {median_val:,.0f}")
+print(f"  Std dev        : {std_val:,.0f}")
+print(f"  1st-half trend : {slope_1st:+.1f} cases/week")
+print(f"  2nd-half trend : {slope_2nd:+.1f} cases/week")
+
+print("\nStep 8: Generating 10 visualisation charts …")
+
+# ── Chart 01 : Raw vs Smooth ──────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(t_obs, obs_raw, alpha=0.18, color=C["c1"], label="Raw weekly")
+ax.plot(t_obs, obs_raw,    lw=1,   alpha=0.6, color=C["c1"])
+ax.plot(t_obs, obs_smooth, lw=2.5, color=C["c2"], label="7-wk centred MA (smooth)")
+style_ax(ax, "Chart 01 — UK COVID-19: Raw vs Smoothed Weekly Cases")
+ax.legend(framealpha=0.2, fontsize=9)
+plt.tight_layout(); SAVE("chart01_raw_vs_smooth.png")
+
+# ── Chart 02 : Log scale ─────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+pos = obs_raw > 0
+ax.semilogy(t_obs[pos], obs_raw[pos],    lw=1, alpha=0.5, color=C["c3"],  label="Raw (log)")
+ax.semilogy(t_obs, np.clip(obs_smooth, 1, None), lw=2.5, color=C["c4"], label="Smooth (log)")
+ax.grid(True, which="both", alpha=0.25)
+style_ax(ax, "Chart 02 — UK COVID-19: Log Scale (reveals all waves)", yl="Weekly Cases (log)")
+ax.legend(framealpha=0.2, fontsize=9)
+plt.tight_layout(); SAVE("chart02_log_scale.png")
+
+# ── Chart 03 : Per-100k ──────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(t_obs, uk_weekly["uk_cases_raw_per100k"], alpha=0.18, color=C["c5"])
+ax.plot(t_obs, uk_weekly["uk_cases_raw_per100k"],    lw=1, alpha=0.6, color=C["c5"], label="Raw per 100k")
+ax.plot(t_obs, uk_weekly["uk_cases_smooth_per100k"], lw=2.5, color=C["c8"],          label="Smooth per 100k")
+style_ax(ax, "Chart 03 — UK COVID-19 Cases per 100,000 Population", yl="Cases per 100k")
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}"))
+ax.legend(framealpha=0.2, fontsize=9)
+plt.tight_layout(); SAVE("chart03_per100k.png")
+
+# ── Chart 04 : Wave detection ────────────────────────────────────────────────
+peaks_idx, _ = find_peaks(obs_smooth,
+                           height=obs_smooth.max()*0.08,
+                           distance=8,
+                           prominence=obs_smooth.max()*0.05)
+wave_cols = [C["c1"],C["c2"],C["c3"],C["c4"],C["c6"],C["c7"],C["c8"]]
+
+fig, ax = plt.subplots(figsize=(14, 6))
+ax.fill_between(t_obs, obs_smooth, alpha=0.15, color=C["c5"])
+ax.plot(t_obs, obs_smooth, lw=2.5, color=C["c5"], label="Smooth cases")
+for i, pi in enumerate(peaks_idx):
+    col = wave_cols[i % len(wave_cols)]
+    ax.axvline(t_obs[pi], color=col, lw=1.5, ls=":", alpha=0.9)
+    ax.annotate(f"Wave {i+1}\n{fmtk(obs_smooth[pi])}",
+                xy=(t_obs[pi], obs_smooth[pi]),
+                xytext=(0, 18), textcoords="offset points",
+                ha="center", fontsize=8, color=col,
+                arrowprops=dict(arrowstyle="->", color=col, lw=1))
+style_ax(ax, f"Chart 04 — Epidemic Waves (detected: {len(peaks_idx)})")
+ax.legend(framealpha=0.2, fontsize=9)
+plt.tight_layout(); SAVE("chart04_waves.png")
+
+# ── Chart 05 : Monthly bar ───────────────────────────────────────────────────
+daily_for_month = pd.DataFrame(
+    {"daily": uk_daily.values}, index=uk_cum.index
+).resample("ME").sum()
+norm_v = daily_for_month["daily"] / daily_for_month["daily"].max()
+bar_c  = plt.cm.plasma(norm_v.values)
+
+fig, ax = plt.subplots(figsize=(16, 5))
+ax.bar(np.arange(len(daily_for_month)), daily_for_month["daily"],
+       color=bar_c, alpha=0.85, width=0.85)
+ax.set_xticks(np.arange(len(daily_for_month))[::3])
+ax.set_xticklabels(
+    [d.strftime("%b\n%Y") for d in daily_for_month.index[::3]],
+    fontsize=7)
+sm = plt.cm.ScalarMappable(cmap="plasma",
+     norm=plt.Normalize(0, daily_for_month["daily"].max()))
+sm.set_array([])
+cb = fig.colorbar(sm, ax=ax, pad=0.01, shrink=0.8)
+cb.set_label("Intensity", color=C["sub"], fontsize=8)
+plt.setp(cb.ax.yaxis.get_ticklabels(), color=C["sub"])
+style_ax(ax, "Chart 05 — UK COVID-19 Monthly New Cases (colour = intensity)",
+         xl="Month", yl="Monthly Cases")
+plt.tight_layout(); SAVE("chart05_monthly_bar.png")
+
+# ── Chart 06 : Rolling-average comparison ───────────────────────────────────
+ma4  = pd.Series(obs_raw).rolling(4,  center=True, min_periods=1).mean().values
+ma12 = pd.Series(obs_raw).rolling(12, center=True, min_periods=1).mean().values
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(t_obs, obs_raw, alpha=0.10, color=C["c7"])
+ax.plot(t_obs, obs_raw,    lw=0.8, alpha=0.4,  color=C["c7"], label="Raw")
+ax.plot(t_obs, ma4,        lw=2,               color=C["c1"], label="4-wk MA")
+ax.plot(t_obs, ma12,       lw=2.5,             color=C["c4"], label="12-wk MA")
+ax.plot(t_obs, obs_smooth, lw=2,   ls="--",    color=C["c2"], label="7-wk centred MA")
+style_ax(ax, "Chart 06 — Moving Average Comparison")
+ax.legend(framealpha=0.2, fontsize=9)
+plt.tight_layout(); SAVE("chart06_moving_averages.png")
+
+# ── Chart 07 : Year-by-year facet ────────────────────────────────────────────
+uk_weekly["year"] = uk_weekly["week_start"].dt.year
+years = sorted(uk_weekly["year"].unique())
+ycols = [C["c1"], C["c2"], C["c3"], C["c4"], C["c5"]]
+
+fig, axes = plt.subplots(len(years), 1, figsize=(14, 8), sharex=False)
+fig.patch.set_facecolor(C["bg"])
+if len(years) == 1: axes = [axes]
+for ax, yr, col in zip(axes, years, ycols):
+    mask = uk_weekly["year"] == yr
+    t_y  = uk_weekly.loc[mask, "week_index"].values
+    v_y  = obs_smooth[mask]
+    ax.fill_between(t_y, v_y, alpha=0.25, color=col)
+    ax.plot(t_y, v_y, lw=2, color=col)
+    ax.set_ylabel(str(yr), color=col, fontsize=9, rotation=0, labelpad=32)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(fmtk))
+    ax.tick_params(axis="x", labelsize=7, rotation=30)
+    ax.grid(True, alpha=0.3); ax.spines[["top","right"]].set_visible(False)
+fig.suptitle("Chart 07 — UK COVID-19 by Calendar Year",
+             fontsize=13, fontweight="bold", color=C["txt"])
+plt.tight_layout(); SAVE("chart07_by_year.png")
+
+# ── Chart 08 : Week-of-year × year heatmap ───────────────────────────────────
+uk_weekly["woy"] = uk_weekly["week_start"].dt.isocalendar().week.astype(int)
+pivot = uk_weekly.pivot_table(
+    index="year", columns="woy", values="uk_cases_smooth", aggfunc="mean")
+
+fig, ax = plt.subplots(figsize=(18, 4))
+im = ax.imshow(pivot.values, aspect="auto", cmap="magma", interpolation="nearest")
+ax.set_yticks(range(len(pivot.index))); ax.set_yticklabels(pivot.index, fontsize=9)
+ax.set_xticks(range(0, 53, 4))
+ax.set_xticklabels([f"W{w}" for w in range(1,54,4)], fontsize=7, rotation=45)
+ax.set_title("Chart 08 — Heatmap: Week-of-Year × Calendar Year",
+             fontsize=12, fontweight="bold", color=C["txt"])
+ax.set_xlabel("Week of year", color=C["sub"]); ax.set_ylabel("Year", color=C["sub"])
+cb = fig.colorbar(im, ax=ax, pad=0.01, shrink=0.9)
+cb.set_label("Smooth cases", color=C["sub"], fontsize=8)
+plt.setp(cb.ax.yaxis.get_ticklabels(), color=C["sub"])
+plt.tight_layout(); SAVE("chart08_heatmap.png")
+
+# ── Chart 09 : Growth rate + cumulative ──────────────────────────────────────
+growth = np.gradient(obs_smooth)
+cumul  = np.cumsum(obs_raw)
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+ax = axes[0]
+ax.bar(t_obs, growth/1e3,
+       color=np.where(growth>=0, C["c3"], C["c6"]), alpha=0.8, width=0.9)
+ax.axhline(0, color=C["txt"], lw=0.9)
+style_ax(ax, "Chart 09a — Weekly Growth Rate (Δ smooth)", yl="Δ Cases/wk (K)")
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}K"))
+
+ax = axes[1]
+ax.fill_between(t_obs, cumul, alpha=0.2, color=C["c5"])
+ax.plot(t_obs, cumul, lw=2.5, color=C["c5"])
+style_ax(ax, "Chart 09b — Cumulative Confirmed Cases", yl="Cumulative Cases")
+plt.tight_layout(); SAVE("chart09_growth_cumulative.png")
+
+# ── Chart 10 : Summary infographic ───────────────────────────────────────────
+fig = plt.figure(figsize=(16, 9)); fig.patch.set_facecolor(C["bg"])
+gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.55, wspace=0.45)
+ax_main = fig.add_subplot(gs[0:2, :])
+
+ax_main.fill_between(t_obs, obs_smooth, alpha=0.18, color=C["c1"])
+ax_main.plot(t_obs, obs_smooth, lw=2.5, color=C["c1"])
+ax_main.axhline(mean_val,   color=C["c3"], lw=1.5, ls="--",
+                label=f"Mean: {fmtk(mean_val)}")
+ax_main.axhline(median_val, color=C["c4"], lw=1.5, ls=":",
+                label=f"Median: {fmtk(median_val)}")
+ax_main.axvline(t_obs[obs_raw.argmax()], color=C["c6"], lw=1.5, ls="--",
+                label=f"Peak: {fmtk(max_val)}")
+ax_main.yaxis.set_major_formatter(mticker.FuncFormatter(fmtk))
+ax_main.set_title("Chart 10 — UK COVID-19 Summary Overview  (T = 163 weeks)",
+                   fontsize=13, fontweight="bold", color=C["txt"])
+ax_main.legend(framealpha=0.2, fontsize=9, loc="upper left")
+ax_main.tick_params(axis="x", rotation=30, labelsize=8)
+ax_main.grid(True, alpha=0.3)
+
+stat_cards = [
+    ("Total Weeks",   f"{n_weeks}",                 C["c1"]),
+    ("Peak Cases",    fmtk(max_val),                C["c6"]),
+    ("Mean/Week",     fmtk(mean_val),               C["c3"]),
+    ("Median/Week",   fmtk(median_val),             C["c4"]),
+]
+for i, (lbl, val, col) in enumerate(stat_cards):
+    ax_s = fig.add_subplot(gs[2, i])
+    ax_s.set_facecolor(C["bg"]); ax_s.set_xlim(0,1); ax_s.set_ylim(0,1); ax_s.axis("off")
+    rect = plt.matplotlib.patches.FancyBboxPatch(
+        (0.05,0.05), 0.9, 0.9, boxstyle="round,pad=0.05",
+        linewidth=2, edgecolor=col, facecolor=C["panel"])
+    ax_s.add_patch(rect)
+    ax_s.text(0.5, 0.65, val,  ha="center", va="center",
+              fontsize=18, fontweight="bold", color=col)
+    ax_s.text(0.5, 0.25, lbl,  ha="center", va="center",
+              fontsize=9, color=C["sub"])
+
+SAVE("chart10_summary_infographic.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — ODE BASELINE  (Step 10)
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("STAGE 3 — ODE BASELINE  (Step 10)")
+print("═"*65)
+
+# Use smoothed series as model target
+obs       = obs_smooth.copy()
+I_scale   = obs.max()
+obs_n     = obs / I_scale           # normalised to [0, 1]
+
+# ── SIRS ODE (via odeint for speed) ──────────────────────────────────────────
+def sirs(y, t, beta, gamma, omega):
+    S, I, R = y;  N = S + I + R
+    return [
+        -beta*S*I/N + omega*R,
+         beta*S*I/N - gamma*I,
+         gamma*I    - omega*R,
+    ]
+
+def ode_loss(p):
+    """p = [log_beta, log_gamma, log_omega, log_k]"""
+    beta, gamma, omega, k = np.exp(p[0]), np.exp(p[1]), np.exp(p[2]), np.exp(p[3])
+    if not (0.05 < beta < 5 and 0.05 < gamma < 2 and 1e-6 < omega < 0.5):
+        return 1e6
+    try:
+        sol = odeint(sirs, [0.9999, 1e-6, 1e-4], t_obs,
+                     args=(beta, gamma, omega),
+                     full_output=False, rtol=1e-5, atol=1e-7, mxstep=500)
+        return np.mean((sol[:, 1] * k - obs_n) ** 2)
+    except Exception:
+        return 1e6
+
+# Multi-start grid search → Nelder-Mead → Powell polish
+print("  Multi-start ODE fitting (45 initial points) …")
+starts = [
+    [np.log(b), np.log(g), np.log(o), np.log(0.001)]
+    for b in [0.3, 0.5, 0.8, 1.2, 2.0]
+    for g in [0.2, 0.4, 0.7]
+    for o in [0.01, 0.03, 0.05]
+]
+best_r, best_v = None, 1e9
+for p0 in starts:
+    r = minimize(ode_loss, p0, method="Nelder-Mead",
+                 options=dict(maxiter=2000, xatol=1e-8, fatol=1e-10))
+    if r.fun < best_v:
+        best_v, best_r = r.fun, r
+
+res_ode = minimize(ode_loss, best_r.x, method="Powell",
+                   options=dict(maxiter=5000, xtol=1e-10, ftol=1e-12))
+p_ode = res_ode.x
+beta_ode, gamma_ode, omega_ode, k_ode = (
+    np.exp(p_ode[0]), np.exp(p_ode[1]), np.exp(p_ode[2]), np.exp(p_ode[3])
+)
+R0_ode    = beta_ode / gamma_ode
+
+sol_ode   = odeint(sirs, [0.9999, 1e-6, 1e-4], t_obs,
+                   args=(beta_ode, gamma_ode, omega_ode),
+                   rtol=1e-6, atol=1e-8)
+I_ode     = sol_ode[:, 1] * k_ode * I_scale
+resid_ode = obs - I_ode
+rmse_ode  = np.sqrt(np.mean(resid_ode**2))
+r2_ode    = 1 - np.sum(resid_ode**2) / np.sum((obs - obs.mean())**2)
+mse_ode   = np.mean(resid_ode**2)
+LL_ode    = -T/2 * np.log(mse_ode)
+aic_ode   = 2*4 - 2*LL_ode
+bic_ode   = np.log(T)*4 - 2*LL_ode
+
+print(f"\n  ODE Baseline Results:")
+print(f"    β  = {beta_ode:.4f} /week")
+print(f"    γ  = {gamma_ode:.4f} /week  (mean inf. period = {1/gamma_ode:.1f} wk)")
+print(f"    ω  = {omega_ode:.6f} /week  (mean immunity = {1/omega_ode:.0f} wk)")
+print(f"    R₀ = {R0_ode:.3f}")
+print(f"    k  = {k_ode:.4f}")
+print(f"    RMSE = {rmse_ode:,.0f} cases/week")
+print(f"    R²   = {r2_ode:.4f}")
+print(f"    AIC  = {aic_ode:.1f}   BIC = {bic_ode:.1f}")
+
+# ── Step 10 charts ────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 1, figsize=(15, 9),
+                          gridspec_kw=dict(height_ratios=[3,1], hspace=0.08))
+ax1, ax2 = axes
+ax1.fill_between(t_obs, obs_raw, alpha=0.12, color=C["c1"], label="Raw observed")
+ax1.plot(t_obs, obs,   lw=2,   color=C["c1"], label="Smoothed observed")
+ax1.plot(t_obs, I_ode, lw=2.5, color=C["c2"], ls="--", label="ODE baseline (const β)")
+ax1.set_xticks([])
+style_ax(ax1, "Step 10 — ODE Baseline: Constant β SIRS Fit  (T = 163 weeks)")
+box = (f"β = {beta_ode:.4f}/wk   γ = {gamma_ode:.4f}/wk   ω = {omega_ode:.6f}/wk\n"
+       f"R₀ = {R0_ode:.3f}   k = {k_ode:.4f}   "
+       f"RMSE = {rmse_ode/1e3:.1f}K/wk   R² = {r2_ode:.4f}\n"
+       f"Date range: 2020-01-27 → 2023-03-06  (163 weeks)")
+ax1.text(0.02, 0.97, box, transform=ax1.transAxes, va="top", fontsize=9.5,
+         color=C["txt"],
+         bbox=dict(fc=C["panel"], ec=C["c2"], lw=1.5, alpha=0.95))
+ax1.legend(framealpha=0.2, fontsize=9)
+
+ax2.bar(t_obs, resid_ode/1e3,
+        color=np.where(resid_ode>=0, C["c3"], C["c6"]), alpha=0.85, width=0.9)
+ax2.axhline(0, color=C["txt"], lw=0.9)
+ax2.set_xlabel("Week index  (0 = 2020-01-27)", color=C["sub"], fontsize=9)
+ax2.set_ylabel("Residual (K)", color=C["sub"], fontsize=9)
+ax2.set_title("Residuals: observed − ODE fit", fontsize=9, color=C["sub"])
+ax2.grid(True, alpha=0.3)
+ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}K"))
+SAVE("step10_ode_fit.png")
+
+# Compartments
+fig, ax = plt.subplots(figsize=(15, 5))
+ax.stackplot(t_obs,
+             sol_ode[:,0]*100, sol_ode[:,1]*100, sol_ode[:,2]*100,
+             labels=["Susceptible %","Infectious %","Recovered %"],
+             colors=[C["c1"], C["c6"], C["c3"]], alpha=0.8)
+style_ax(ax, "Step 10 — ODE Compartments S/I/R  (163 weeks)", yl="% Population")
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.1f}%"))
+ax.legend(framealpha=0.2, fontsize=9)
+plt.tight_layout(); SAVE("step10_ode_compartments.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STAGE 4 — PINN  (Step 11)
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("STAGE 4 — PINN CONSTANT β  (Step 11)")
+print("═"*65)
+print("  Architecture: 4-layer MLP  [1→16→32→16→3]  (tanh activations)")
+print("  Loss = λ_data · L_data  +  λ_phys · L_physics")
+print("  Strategy: warm-start to ODE solution → joint optimisation (2 stages)")
+
+# ── MLP helpers ───────────────────────────────────────────────────────────────
+ARCH = [1, 16, 32, 16, 3]
+
+def mlp_n_params():
+    return sum(ARCH[i]*ARCH[i+1] + ARCH[i+1] for i in range(len(ARCH)-1))
+
+def mlp_forward(t_in, params):
+    """t_in: (N,) normalised → output: (N, 3) softmax → sums to 1."""
+    idx = 0
+    h   = t_in.reshape(-1, 1)
+    for i in range(len(ARCH)-1):
+        ni, no = ARCH[i], ARCH[i+1]
+        W = params[idx : idx + ni*no].reshape(no, ni); idx += ni*no
+        b = params[idx : idx + no];                    idx += no
+        h = h @ W.T + b
+        if i < len(ARCH)-2:
+            h = np.tanh(h)
+    e = np.exp(h - h.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+
+def mlp_d_dt(t_pts, params, eps=0.08):
+    """Numerical derivative of MLP output w.r.t. t."""
+    return (mlp_forward(t_pts + eps, params)
+          - mlp_forward(t_pts - eps, params)) / (2 * eps)
+
+NP    = mlp_n_params()
+t_n   = t_obs / t_obs.max()        # normalise time to [0,1]
+print(f"  MLP parameter count: {NP}")
+
+# ── Warm-start: fit MLP to ODE compartment trajectories ──────────────────────
+print("  Warm-starting MLP to ODE solution …")
+SIR_ode_target = sol_ode.copy()   # (T, 3)
+
+def warm_loss(pn):
+    pred = mlp_forward(t_n, pn)
+    return np.mean((pred - SIR_ode_target)**2)
+
+rng = np.random.default_rng(7)
+pn0 = rng.normal(0, 0.05, NP)
+rw  = minimize(warm_loss, pn0, method="L-BFGS-B",
+               options=dict(maxiter=400, ftol=1e-12))
+print(f"    Warm-start residual: {rw.fun:.6f}")
+
+# ── PINN joint loss ───────────────────────────────────────────────────────────
+phys0 = np.array([np.log(beta_ode), np.log(gamma_ode),
+                  np.log(omega_ode), np.log(k_ode)])
+
+def pinn_loss(x, lam=0.5):
+    """x = [net_params | log_beta, log_gamma, log_omega, log_k]"""
+    pn   = x[:NP];  pp = x[NP:]
+    beta, gamma, omega, k = (np.exp(pp[0]), np.exp(pp[1]),
+                              np.exp(pp[2]), np.exp(pp[3]))
+    SIR    = mlp_forward(t_n, pn)
+    I_pred = SIR[:, 1] * k
+    Ld     = np.mean((I_pred - obs_n)**2)
+
+    dSIR      = mlp_d_dt(t_n, pn)
+    S, I, R   = SIR[:,0], SIR[:,1], SIR[:,2];  N = S+I+R
+    rS = dSIR[:,0] - (-beta*S*I/N + omega*R)
+    rI = dSIR[:,1] - ( beta*S*I/N - gamma*I)
+    rR = dSIR[:,2] - ( gamma*I    - omega*R)
+    Lp = np.mean(rS**2 + rI**2 + rR**2)
+    return Ld + lam * Lp
+
+x0   = np.concatenate([rw.x, phys0])
+print("  Stage 1: L-BFGS-B  λ_phys = 0.5 …")
+res1 = minimize(pinn_loss, x0, method="L-BFGS-B",
+                options=dict(maxiter=1000, ftol=1e-14, gtol=1e-9))
+print("  Stage 2: L-BFGS-B  λ_phys = 1.5 …")
+res2 = minimize(lambda x: pinn_loss(x, lam=1.5), res1.x,
+                method="L-BFGS-B",
+                options=dict(maxiter=1000, ftol=1e-15, gtol=1e-10))
+
+xf     = res2.x
+pn_f   = xf[:NP];  pp_f = xf[NP:]
+beta_p, gamma_p, omega_p, k_p = (
+    np.exp(pp_f[0]), np.exp(pp_f[1]), np.exp(pp_f[2]), np.exp(pp_f[3])
+)
+R0_p = beta_p / gamma_p
+
+SIR_p     = mlp_forward(t_n, pn_f)
+I_pinn    = SIR_p[:, 1] * k_p * I_scale
+resid_p   = obs - I_pinn
+rmse_p    = np.sqrt(np.mean(resid_p**2))
+r2_p      = 1 - np.sum(resid_p**2) / np.sum((obs-obs.mean())**2)
+
+# Physics residual at observation times
+dSIR_f = mlp_d_dt(t_n, pn_f)
+S, I, R = SIR_p[:,0], SIR_p[:,1], SIR_p[:,2];  N = S+I+R
+phy_rS = dSIR_f[:,0] - (-beta_p*S*I/N + omega_p*R)
+phy_rI = dSIR_f[:,1] - ( beta_p*S*I/N - gamma_p*I)
+phy_rR = dSIR_f[:,2] - ( gamma_p*I    - omega_p*R)
+
+print(f"\n  PINN Results (constant β):")
+print(f"    β  = {beta_p:.4f} /week")
+print(f"    γ  = {gamma_p:.4f} /week  (mean inf. period = {1/gamma_p:.1f} wk)")
+print(f"    ω  = {omega_p:.6f} /week")
+print(f"    R₀ = {R0_p:.3f}")
+print(f"    k  = {k_p:.4f}")
+print(f"    RMSE      = {rmse_p:,.0f}")
+print(f"    R²        = {r2_p:.4f}")
+print(f"    Data loss = {np.mean((SIR_p[:,1]*k_p - obs_n)**2):.6f}")
+print(f"    Phys loss = {np.mean(phy_rS**2+phy_rI**2+phy_rR**2):.6f}")
+
+# ── Step 11 charts ────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(17, 11)); fig.patch.set_facecolor(C["bg"])
+gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.50, wspace=0.35)
+ax_fit  = fig.add_subplot(gs[0:2, 0]); ax_dres = fig.add_subplot(gs[2, 0])
+ax_phys = fig.add_subplot(gs[0, 1]);   ax_sir  = fig.add_subplot(gs[1, 1])
+ax_cmp  = fig.add_subplot(gs[2, 1])
+
+ax_fit.fill_between(t_obs, obs_raw, alpha=0.10, color=C["c1"])
+ax_fit.plot(t_obs, obs,    lw=2,   color=C["c1"], label="Observed (smooth)")
+ax_fit.plot(t_obs, I_pinn, lw=2.5, color=C["c5"], ls="--", label="PINN fit")
+ax_fit.plot(t_obs, I_ode,  lw=1.8, color=C["c2"], ls=":",  label="ODE baseline", alpha=0.8)
+style_ax(ax_fit, "Step 11 — PINN (Const β)  T = 163 weeks")
+box = (f"β={beta_p:.4f}  γ={gamma_p:.4f}  ω={omega_p:.6f}\n"
+       f"R₀={R0_p:.3f}  k={k_p:.4f}\n"
+       f"RMSE={rmse_p/1e3:.1f}K  R²={r2_p:.4f}")
+ax_fit.text(0.02, 0.97, box, transform=ax_fit.transAxes, va="top", fontsize=9,
+            color=C["txt"],
+            bbox=dict(fc=C["panel"], ec=C["c5"], lw=1.5, alpha=0.95))
+ax_fit.legend(framealpha=0.2, fontsize=9); ax_fit.set_xticks([])
+
+ax_dres.bar(t_obs, resid_p/1e3,
+            color=np.where(resid_p>=0, C["c3"], C["c6"]), alpha=0.8, width=0.9)
+ax_dres.axhline(0, color=C["txt"], lw=0.9)
+style_ax(ax_dres, "PINN Data Residual", yl="Residual (K)")
+ax_dres.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}K"))
+
+ax_phys.semilogy(t_obs, np.abs(phy_rS), color=C["c1"], lw=1.5, label="|ΔS|")
+ax_phys.semilogy(t_obs, np.abs(phy_rI), color=C["c6"], lw=1.5, label="|ΔI|")
+ax_phys.semilogy(t_obs, np.abs(phy_rR), color=C["c3"], lw=1.5, label="|ΔR|")
+ax_phys.set_title("Physics Residual by Compartment",
+                   fontsize=10, fontweight="bold", color=C["txt"])
+ax_phys.set_xlabel("Week", color=C["sub"], fontsize=9)
+ax_phys.set_ylabel("|ODE residual|", color=C["sub"], fontsize=9)
+ax_phys.legend(framealpha=0.2, fontsize=8); ax_phys.grid(True, alpha=0.3)
+
+ax_sir.plot(t_obs, SIR_p[:,0]*100, color=C["c1"], lw=2, label="S%")
+ax_sir.plot(t_obs, SIR_p[:,1]*100, color=C["c6"], lw=2, label="I%")
+ax_sir.plot(t_obs, SIR_p[:,2]*100, color=C["c3"], lw=2, label="R%")
+ax_sir.set_title("PINN Compartments S/I/R",
+                  fontsize=10, fontweight="bold", color=C["txt"])
+ax_sir.set_xlabel("Week", color=C["sub"], fontsize=9)
+ax_sir.set_ylabel("% Population", color=C["sub"], fontsize=9)
+ax_sir.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.1f}%"))
+ax_sir.legend(framealpha=0.2, fontsize=8); ax_sir.grid(True, alpha=0.3)
+
+delta = I_pinn - I_ode
+ax_cmp.plot(t_obs, delta/1e3, color=C["c7"], lw=2)
+ax_cmp.axhline(0, color=C["txt"], lw=0.8, ls="--")
+ax_cmp.fill_between(t_obs, delta/1e3, 0, alpha=0.2, color=C["c7"])
+ax_cmp.set_title("PINN − ODE (difference)",
+                  fontsize=10, fontweight="bold", color=C["txt"])
+ax_cmp.set_xlabel("Week", color=C["sub"], fontsize=9)
+ax_cmp.set_ylabel("Δ (K)", color=C["sub"], fontsize=9)
+ax_cmp.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}K"))
+ax_cmp.grid(True, alpha=0.3)
+
+fig.suptitle("Step 11 — PINN (Constant β SIRS)  |  T = 163 weeks",
+             fontsize=14, fontweight="bold", color=C["txt"])
+SAVE("step11_pinn_const_beta.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STAGE 5 — FORWARD SIMULATION  (Step 12)
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("STAGE 5 — FORWARD SIMULATION  (Step 12)")
+print("═"*65)
+
+T_ext   = T + 26                            # 163 + 26 = 189 weeks
+t_ext   = np.arange(T_ext, dtype=float)
+
+# ODE forward using PINN-learned parameters
+sol_fwd = odeint(sirs,
+                 [SIR_p[0,0], SIR_p[0,1], SIR_p[0,2]],
+                 t_ext,
+                 args=(beta_p, gamma_p, omega_p),
+                 rtol=1e-6, atol=1e-8)
+I_fwd   = sol_fwd[:, 1] * k_p * I_scale
+
+# PINN MLP extrapolation (outside training domain)
+t_ext_n    = t_ext / t_obs.max()
+SIR_ext    = mlp_forward(t_ext_n, pn_f)
+I_pinn_ext = SIR_ext[:, 1] * k_p * I_scale
+
+print(f"  In-sample  : weeks 0–{T-1}  ({T} weeks)")
+print(f"  Forecast   : weeks {T}–{T_ext-1}  (+26 weeks)")
+
+fig, axes = plt.subplots(2, 1, figsize=(16, 10),
+                          gridspec_kw=dict(height_ratios=[3,1], hspace=0.08))
+ax1, ax2 = axes
+ax1.axvspan(T, T_ext, alpha=0.06, color=C["c4"])
+ax1.text(T + 0.5, obs.max()*0.90, "← 26-wk Forecast",
+         color=C["c4"], fontsize=9)
+ax1.fill_between(t_obs, obs_raw, alpha=0.10, color=C["c1"])
+ax1.plot(t_obs, obs,         lw=2.5, color=C["c1"],  label="Observed (smooth)")
+ax1.plot(t_ext, I_fwd,       lw=2.5, color=C["c2"], ls="--",
+         label="ODE forward (PINN params)")
+ax1.plot(t_ext, I_pinn_ext,  lw=2.5, color=C["c5"], ls=":",
+         label="PINN MLP extrapolation")
+ax1.axvline(T - 1, color=C["txt"], lw=1.2, ls="--", alpha=0.5)
+style_ax(ax1, "Step 12 — Forward Simulation: Observed vs PINN vs ODE  (T=163, +26 wk)")
+ax1.legend(framealpha=0.2, fontsize=9); ax1.set_xticks([])
+
+diff = I_pinn_ext[:T] - I_fwd[:T]
+ax2.bar(t_obs, diff/1e3,
+        color=np.where(diff>=0, C["c5"], C["c2"]), alpha=0.8, width=0.9)
+ax2.axhline(0, color=C["txt"], lw=0.9)
+ax2.set_xlabel("Week index  (0 = 2020-01-27)", color=C["sub"], fontsize=9)
+ax2.set_ylabel("PINN−ODE (K)", color=C["sub"], fontsize=9)
+ax2.set_title("In-sample discrepancy: PINN MLP − ODE forward",
+              fontsize=9, color=C["sub"])
+ax2.grid(True, alpha=0.3)
+ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}K"))
+SAVE("step12_forward_simulation.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STAGE 6 — PIECEWISE β(t)  (Step 13)
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("STAGE 6 — PIECEWISE β(t)  (Step 13: K = 4, 6, 8)")
+print("═"*65)
+
+# ── Shared SIRS with piecewise-constant β ────────────────────────────────────
+def sirs_pw(y, t, beta_arr):
+    S, I, R = y;  N = S + I + R
+    ti   = min(int(round(t)), len(beta_arr) - 1)
+    beta = beta_arr[ti]
+    return [
+        -beta*S*I/N + omega_ode*R,
+         beta*S*I/N - gamma_ode*I,
+         gamma_ode*I - omega_ode*R,
+    ]
+# Note: γ and ω fixed at ODE baseline values to reduce parameter space.
+
+def make_beta_arr(log_betas, bps, T_):
+    betas = np.exp(np.clip(log_betas, -2.5, 1.5))
+    arr   = np.full(T_, betas[0])
+    bps_s = np.sort(np.clip(np.round(bps).astype(int), 5, T_-5))
+    segs  = np.concatenate([[0], bps_s, [T_]])
+    for i in range(len(segs)-1):
+        arr[segs[i] : segs[i+1]] = betas[i]
+    return arr
+
+def fit_piecewise(K):
+    print(f"\n  Fitting K={K} …")
+    K_ = K   # capture
+
+    def loss(p):
+        lb  = p[:K_]
+        bps = p[K_ : K_+(K_-1)]
+        k   = np.exp(p[-1])
+        arr = make_beta_arr(lb, bps, T)
+        try:
+            sol = odeint(sirs_pw, [0.9999, 1e-6, 1e-4], t_obs,
+                         args=(arr,), full_output=False,
+                         rtol=1e-4, atol=1e-6, mxstep=300)
+            return np.mean((sol[:,1]*k - obs_n)**2)
+        except Exception:
+            return 1e6
+
+    # Global search via differential evolution
+    bounds = ([(-2.5, 1.5)] * K_
+              + [(5, T-5)] * (K_-1)
+              + [(-2, 6)])
+    res_de = differential_evolution(
+        loss, bounds, seed=42, maxiter=400,
+        popsize=12, tol=1e-6, workers=1, polish=True)
+
+    # Polish with Powell
+    res    = minimize(loss, res_de.x, method="Powell",
+                      options=dict(maxiter=5000, xtol=1e-10, ftol=1e-12))
+    p      = res.x
+
+    bps_fit = np.sort(np.clip(np.round(p[K_:K_+(K_-1)]).astype(float), 5, T-5))
+    k_fit   = np.exp(p[-1])
+    arr_fit = make_beta_arr(p[:K_], bps_fit, T)
+    betas_fit = np.exp(np.clip(p[:K_], -2.5, 1.5))
+
+    sol_fit = odeint(sirs_pw, [0.9999, 1e-6, 1e-4], t_obs,
+                     args=(arr_fit,), rtol=1e-5, atol=1e-8)
+    I_fit   = sol_fit[:,1] * k_fit * I_scale
+    resid   = obs - I_fit
+    mse_    = np.mean(resid**2)
+    rmse    = np.sqrt(mse_)
+    r2_     = 1 - np.sum(resid**2)/np.sum((obs-obs.mean())**2)
+    n_p     = K_ + (K_-1) + 3          # betas + bps + (γ,ω fixed) + k
+    LL_     = -T/2 * np.log(mse_)
+    aic     = 2*n_p - 2*LL_
+    bic     = np.log(T)*n_p - 2*LL_
+
+    bps_int  = bps_fit.astype(int)
+    bp_dates = [uk_weekly["week_start"].iloc[bp].strftime("%Y-%m-%d")
+                for bp in bps_int]
+    print(f"    β segments : {betas_fit.round(4)}")
+    print(f"    Breakpoints: weeks {bps_int}  =  {bp_dates}")
+    print(f"    RMSE={rmse:,.0f}  R²={r2_:.4f}  AIC={aic:.1f}  BIC={bic:.1f}")
+
+    return dict(
+        K=K_, log_betas=np.clip(p[:K_], -2.5, 1.5),
+        betas=betas_fit, bps=bps_fit, bps_int=bps_int,
+        bp_dates=bp_dates, k=k_fit,
+        I_fit=I_fit, resid=resid, rmse=rmse, r2=r2_,
+        aic=aic, bic=bic, n_params=n_p, beta_arr=arr_fit,
+    )
+
+pw = {}
+for K in [4, 6, 8]:
+    pw[K] = fit_piecewise(K)
+
+# ── Model-selection summary ───────────────────────────────────────────────────
+print("\n  " + "─"*63)
+print(f"  {'Model':<16} {'n_p':>4}  {'RMSE':>9}  {'R²':>8}  {'AIC':>9}  {'BIC':>9}")
+print(f"  {'ODE (K=1)':<16} {'4':>4}  {rmse_ode:>9,.0f}  {r2_ode:>8.4f}  "
+      f"{aic_ode:>9.1f}  {bic_ode:>9.1f}")
+for K in [4, 6, 8]:
+    r = pw[K]
+    marker = "  ← best AIC" if r["aic"] == min(pw[k]["aic"] for k in [4,6,8]) and r["aic"] < aic_ode else ""
+    print(f"  {'Piecewise K='+str(K):<16} {r['n_params']:>4}  {r['rmse']:>9,.0f}  "
+          f"{r['r2']:>8.4f}  {r['aic']:>9.1f}  {r['bic']:>9.1f}{marker}")
+print("  " + "─"*63)
+
+Kcols = {4: C["c3"], 6: C["c4"], 8: C["c5"]}
+
+# ── Chart: 3-panel piecewise fits ────────────────────────────────────────────
+fig, axes = plt.subplots(3, 1, figsize=(16, 15), sharex=True)
+fig.patch.set_facecolor(C["bg"])
+for ax, K in zip(axes, [4, 6, 8]):
+    r = pw[K]
+    ax.fill_between(t_obs, obs_raw, alpha=0.08, color=C["c1"])
+    ax.plot(t_obs, obs,       lw=2,   color=C["c1"],  label="Observed")
+    ax.plot(t_obs, r["I_fit"],lw=2.5, color=Kcols[K], ls="--", label=f"K={K} fit")
+    segs = np.concatenate([[0], r["bps"], [T]])
+    for i in range(len(segs)-1):
+        ax.axvspan(segs[i], segs[i+1],
+                   alpha=0.04 if i%2==0 else 0, color=Kcols[K])
+        if i < len(segs)-2:
+            ax.axvline(segs[i+1], color=Kcols[K], lw=1.0, ls=":", alpha=0.7)
+        mid = (segs[i] + segs[i+1]) / 2
+        ax.text(mid, obs.max()*0.88, f"β={r['betas'][i]:.3f}",
+                ha="center", fontsize=7.5, color=Kcols[K])
+    style_ax(ax, (f"K={K}  |  RMSE={r['rmse']/1e3:.1f}K  "
+                  f"R²={r['r2']:.4f}  AIC={r['aic']:.0f}  BIC={r['bic']:.0f}"))
+    ax.legend(framealpha=0.2, fontsize=9)
+    ax.set_xticks([])
+axes[-1].set_xlabel(
+    "Week index  (0 = 2020-01-27, 162 = 2023-03-06)",
+    color=C["sub"], fontsize=9)
+axes[-1].tick_params(axis="x", bottom=True, labelbottom=True)
+fig.suptitle("Step 13 — Piecewise β(t): K=4, 6, 8  |  T = 163 weeks",
+             fontsize=14, fontweight="bold", color=C["txt"])
+plt.tight_layout(); SAVE("step13_piecewise_fits.png")
+
+# ── Chart: β(t) timeline ─────────────────────────────────────────────────────
+fig, axes = plt.subplots(3, 1, figsize=(16, 9), sharex=True)
+fig.patch.set_facecolor(C["bg"])
+for ax, K in zip(axes, [4, 6, 8]):
+    r    = pw[K]
+    segs = np.concatenate([[0], r["bps"], [T]])
+    ts, bs = [], []
+    for i in range(len(segs)-1):
+        ts += [segs[i], segs[i+1]]; bs += [r["betas"][i], r["betas"][i]]
+    ax.plot(ts, bs, color=Kcols[K], lw=2.5,
+            drawstyle="steps-post", label=f"K={K} β(t)")
+    ax.axhline(beta_ode, color=C["c2"], lw=1.5, ls="--", alpha=0.7,
+               label=f"Const β={beta_ode:.4f}")
+    for bp in r["bps"]:
+        ax.axvline(bp, color=C["sub"], lw=0.8, ls=":", alpha=0.5)
+    ax.set_ylabel("β(t) /wk", color=C["sub"], fontsize=9)
+    ax.set_title(f"K={K}  segments={r['betas'].round(3).tolist()}",
+                 fontsize=10, fontweight="bold", color=C["txt"])
+    ax.legend(framealpha=0.2, fontsize=8); ax.grid(True, alpha=0.3)
+axes[-1].set_xlabel("Week index  (0 = 2020-01-27)", color=C["sub"], fontsize=9)
+fig.suptitle("Step 13 — Piecewise β(t) Timeline  |  T = 163 weeks",
+             fontsize=14, fontweight="bold", color=C["txt"])
+plt.tight_layout(); SAVE("step13_beta_timeline.png")
+
+# ── Chart: Model selection bars (2×2) ────────────────────────────────────────
+labels_all = ["ODE\n(K=1)", "Piece.\nK=4", "Piece.\nK=6", "Piece.\nK=8"]
+rmses_all  = [rmse_ode] + [pw[k]["rmse"] for k in [4,6,8]]
+aics_all   = [aic_ode]  + [pw[k]["aic"]  for k in [4,6,8]]
+bics_all   = [bic_ode]  + [pw[k]["bic"]  for k in [4,6,8]]
+r2s_all    = [r2_ode]   + [pw[k]["r2"]   for k in [4,6,8]]
+bar_cols   = [C["c2"], C["c3"], C["c4"], C["c5"]]
+x          = np.arange(len(labels_all))
+
+fig, axes2 = plt.subplots(2, 2, figsize=(15, 9))
+fig.patch.set_facecolor(C["bg"])
+
+# RMSE
+ax = axes2[0,0]
+bars = ax.bar(x, np.array(rmses_all)/1e3, color=bar_cols, alpha=0.85, width=0.6)
+ax.set_xticks(x); ax.set_xticklabels(labels_all, fontsize=10)
+style_ax(ax, "RMSE  (↓ better)", xl="Model", yl="RMSE (K cases/wk)")
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v,_: f"{v:.0f}K"))
+for b, v in zip(bars, rmses_all):
+    ax.text(b.get_x()+b.get_width()/2, b.get_height()+0.5,
+            f"{v/1e3:.1f}K", ha="center", fontsize=9, color=C["txt"])
+
+# AIC
+ax = axes2[0,1]
+ax.bar(x, aics_all, color=bar_cols, alpha=0.85, width=0.6)
+bi = int(np.argmin(aics_all))
+ax.bar(bi, aics_all[bi], color=bar_cols[bi], alpha=1, width=0.6,
+       edgecolor=C["c7"], linewidth=2.5)
+ax.set_xticks(x); ax.set_xticklabels(labels_all, fontsize=10)
+style_ax(ax, "AIC  (↓ better, ★ = best)", xl="Model", yl="AIC")
+ax.text(bi, aics_all[bi]-30, "★ Best", ha="center", fontsize=10, color=C["c7"])
+
+# BIC
+ax = axes2[1,0]
+ax.bar(x, bics_all, color=bar_cols, alpha=0.85, width=0.6)
+bb = int(np.argmin(bics_all))
+ax.bar(bb, bics_all[bb], color=bar_cols[bb], alpha=1, width=0.6,
+       edgecolor=C["c7"], linewidth=2.5)
+ax.set_xticks(x); ax.set_xticklabels(labels_all, fontsize=10)
+style_ax(ax, "BIC  (↓ better, ★ = best)", xl="Model", yl="BIC")
+ax.text(bb, bics_all[bb]-30, "★ Best", ha="center", fontsize=10, color=C["c7"])
+
+# R²
+ax = axes2[1,1]
+ax.bar(x, r2s_all, color=bar_cols, alpha=0.85, width=0.6)
+ax.set_xticks(x); ax.set_xticklabels(labels_all, fontsize=10)
+style_ax(ax, "R²  (↑ better)", xl="Model", yl="R²")
+ax.set_ylim(max(0, min(r2s_all)-0.05), 1.02)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v,_: f"{v:.3f}"))
+for i, v in enumerate(r2s_all):
+    ax.text(i, v+0.005, f"{v:.4f}", ha="center", fontsize=9, color=C["txt"])
+
+fig.suptitle("Step 13 — Model Selection: RMSE / AIC / BIC / R²  |  T = 163 weeks",
+             fontsize=13, fontweight="bold", color=C["txt"])
+plt.tight_layout(); SAVE("step13_model_selection.png")
+
+# ── Chart: Residuals 2×2 ─────────────────────────────────────────────────────
+fig, axes3 = plt.subplots(2, 2, figsize=(16, 9))
+fig.patch.set_facecolor(C["bg"])
+pairs = [("ODE (K=1)", resid_ode, C["c2"]),
+         ("K=4",       pw[4]["resid"], C["c3"]),
+         ("K=6",       pw[6]["resid"], C["c4"]),
+         ("K=8",       pw[8]["resid"], C["c5"])]
+for (lbl, res, col), ax in zip(pairs, axes3.flat):
+    ax.bar(t_obs, res/1e3,
+           color=np.where(res>=0, col, C["c6"]), alpha=0.85, width=0.9)
+    ax.axhline(0, color=C["txt"], lw=0.9)
+    ax.set_title(f"Residuals — {lbl}  "
+                 f"RMSE={np.sqrt(np.mean(res**2))/1e3:.1f}K",
+                 fontsize=10, fontweight="bold", color=C["txt"])
+    ax.set_xlabel("Week", color=C["sub"], fontsize=9)
+    ax.set_ylabel("Residual (K)", color=C["sub"], fontsize=9)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: f"{x:.0f}K"))
+    ax.grid(True, alpha=0.3)
+fig.suptitle("Step 13 — Residuals Across All Models  |  T = 163 weeks",
+             fontsize=13, fontweight="bold", color=C["txt"])
+plt.tight_layout(); SAVE("step13_residuals.png")
+
+# ── Chart: Grand comparison (all models on one plot) ─────────────────────────
+best_K = min([4,6,8], key=lambda k: pw[k]["aic"])
+br     = pw[best_K]
+fig, ax = plt.subplots(figsize=(18, 7)); fig.patch.set_facecolor(C["bg"])
+ax.fill_between(t_obs, obs_raw, alpha=0.08, color=C["c1"])
+ax.plot(t_obs, obs,            lw=2.5, color=C["c1"],  label="Observed (smooth)")
+ax.plot(t_obs, I_ode,          lw=2,   color=C["c2"],  ls=":",  label="ODE const β")
+ax.plot(t_obs, I_pinn,         lw=2,   color=C["c7"],  ls="--", label="PINN const β")
+for K, col in [(4,C["c3"]), (6,C["c4"]), (8,C["c5"])]:
+    ax.plot(t_obs, pw[K]["I_fit"], lw=2, color=col, ls="--",
+            label=f"Piecewise K={K}")
+style_ax(ax, "All Models vs Observed — UK COVID-19 Weekly Cases  (T = 163 weeks)")
+ax.legend(framealpha=0.2, fontsize=10, loc="upper left")
+box = (f"Best by AIC: K={best_K}\n"
+       f"RMSE={br['rmse']/1e3:.1f}K  R²={br['r2']:.4f}\n"
+       f"AIC={br['aic']:.0f}  BIC={br['bic']:.0f}\n"
+       f"β segments={br['betas'].round(3).tolist()}\n"
+       f"Breakpoints={br['bps_int'].tolist()}  (weeks)\n"
+       f"             ={br['bp_dates']}")
+ax.text(0.99, 0.97, box, transform=ax.transAxes, va="top", ha="right",
+        fontsize=8.5, color=C["txt"],
+        bbox=dict(fc=C["panel"], ec=Kcols[best_K], lw=1.5, alpha=0.95))
+plt.tight_layout(); SAVE("step13_grand_comparison.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*65)
+print("PIPELINE COMPLETE")
+print("═"*65)
+print(f"\n  Data: {T} weeks (2020-01-27 → 2023-03-06)")
+print(f"\n  ODE Baseline (K=1):")
+print(f"    β={beta_ode:.4f}  γ={gamma_ode:.4f}  ω={omega_ode:.6f}")
+print(f"    R₀={R0_ode:.3f}  RMSE={rmse_ode:,.0f}  R²={r2_ode:.4f}")
+print(f"    AIC={aic_ode:.1f}  BIC={bic_ode:.1f}")
+print(f"\n  PINN Constant β:")
+print(f"    β={beta_p:.4f}  γ={gamma_p:.4f}  ω={omega_p:.6f}")
+print(f"    R₀={R0_p:.3f}  RMSE={rmse_p:,.0f}  R²={r2_p:.4f}")
+print(f"\n  Piecewise β(t):")
+print(f"  {'K':<4} {'n_p':>4}  {'RMSE':>9}  {'R²':>8}  {'AIC':>9}  {'BIC':>9}")
+for K in [4,6,8]:
+    r = pw[K]
+    star = " ← best AIC" if K == best_K else ""
+    print(f"  {K:<4} {r['n_params']:>4}  {r['rmse']:>9,.0f}  "
+          f"{r['r2']:>8.4f}  {r['aic']:>9.1f}  {r['bic']:>9.1f}{star}")
+print(f"\n  Best model by AIC/BIC: K={best_K}")
+print(f"    β segments : {br['betas'].round(4)}")
+print(f"    Breakpoints: {br['bp_dates']}")
+print(f"\n  Charts saved to: {OUT_DIR}/")
+print("═"*65)
