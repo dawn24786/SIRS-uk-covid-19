@@ -1,0 +1,443 @@
+"""
+=============================================================================
+UK COVID-19 Data Pipeline for SIRS Model Parameter Estimation
+Project: Parameter Estimation and Uncertainty Analysis for an SIRS Model
+         of COVID-19 Using Real Data
+=============================================================================
+Pipeline:
+  Stage 1  – Load & inspect the JHU global confirmed CSV
+  Stage 2  – Filter UK, convert cumulative→daily, weekly aggregation,
+             smoothing, scaling → save uk_weekly_cases_clean.csv
+  Stage 3  – 10 professional visualisation charts (Steps 8-9)
+=============================================================================
+"""
+
+# ── Imports ─────────────────────────────────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")                     # headless backend (no display needed)
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
+from matplotlib.ticker import FuncFormatter
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import savgol_filter
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+RAW_CSV   = "/mnt/user-data/uploads/time_series_covid19_confirmed_global__1_.csv"
+CLEAN_CSV = "/mnt/user-data/outputs/uk_weekly_cases_clean.csv"
+CHART_DIR = "/mnt/user-data/outputs/"
+
+import os
+os.makedirs(CHART_DIR, exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STAGE 1  –  Load raw data & quick inspection
+# ═══════════════════════════════════════════════════════════════════════════
+print("=" * 65)
+print("STAGE 1 – Load & Inspect JHU Confirmed Cases")
+print("=" * 65)
+
+raw = pd.read_csv(RAW_CSV)
+print(f"  Raw shape          : {raw.shape}")
+print(f"  Columns (first 6)  : {raw.columns[:6].tolist()}")
+date_cols = raw.columns[4:]
+print(f"  Date columns       : {len(date_cols)}  ({date_cols[0]} … {date_cols[-1]})")
+print(f"  Countries (unique) : {raw['Country/Region'].nunique()}")
+print()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STAGE 2  –  Generate the UK Weekly Dataset
+# ═══════════════════════════════════════════════════════════════════════════
+print("=" * 65)
+print("STAGE 2 – Build UK Weekly Dataset")
+print("=" * 65)
+
+# ── Step 1/3 : Filter United Kingdom ────────────────────────────────────────
+uk_raw = raw[raw["Country/Region"] == "United Kingdom"].copy()
+print(f"  UK rows (provinces/overseas): {len(uk_raw)}")
+
+# Sum all UK sub-regions → single national time series (cumulative)
+uk_cumulative = uk_raw[date_cols].sum(axis=0)
+uk_cumulative.index = pd.to_datetime(uk_cumulative.index, format="%m/%d/%y")
+uk_cumulative = uk_cumulative.sort_index()
+print(f"  Cumulative series  : {len(uk_cumulative)} daily points")
+print(f"  Final cumulative   : {uk_cumulative.iloc[-1]:,.0f} confirmed cases")
+
+# ── Step 4 : Convert cumulative → daily new cases ────────────────────────────
+daily_new = uk_cumulative.diff().fillna(0)
+
+# Handle negative values (data-correction artefacts) → clip to 0
+neg_count = (daily_new < 0).sum()
+print(f"  Negative daily values found: {neg_count}  → set to 0")
+daily_new = daily_new.clip(lower=0)
+
+# Build a clean daily DataFrame
+df_daily = pd.DataFrame({
+    "date"      : daily_new.index,
+    "daily_new" : daily_new.values
+}).set_index("date")
+
+print(f"  Daily new cases max : {df_daily['daily_new'].max():,.0f}")
+print(f"  Daily new cases mean: {df_daily['daily_new'].mean():,.0f}")
+
+# ── Step 5 : Resample to weekly (Monday-anchored, sum) ───────────────────────
+df_weekly = df_daily.resample("W-MON").sum()
+df_weekly.index.name = "week_start"
+df_weekly.rename(columns={"daily_new": "uk_cases_raw"}, inplace=True)
+
+# Drop leading zeros before first detection
+first_nonzero = (df_weekly["uk_cases_raw"] > 0).idxmax()
+df_weekly = df_weekly.loc[first_nonzero:]
+print(f"\n  Weekly rows (after trimming leading zeros): {len(df_weekly)}")
+print(f"  Week range: {df_weekly.index[0].date()} → {df_weekly.index[-1].date()}")
+
+# ── Step 6 : Smoothing ───────────────────────────────────────────────────────
+# Savitzky-Golay for first-pass, then light Gaussian for PINN-ready column
+window_sg = min(11, len(df_weekly) if len(df_weekly) % 2 == 1 else len(df_weekly) - 1)
+sg_smooth = savgol_filter(df_weekly["uk_cases_raw"].values,
+                          window_length=window_sg, polyorder=3)
+sg_smooth = np.clip(sg_smooth, 0, None)
+
+df_weekly["uk_cases_smooth"] = sg_smooth
+
+# Min-max scaling (0-1) stored as extra columns for PINN convenience
+scale_max = df_weekly["uk_cases_raw"].max()
+df_weekly["uk_cases_raw_scaled"]    = df_weekly["uk_cases_raw"]    / scale_max
+df_weekly["uk_cases_smooth_scaled"] = df_weekly["uk_cases_smooth"] / scale_max
+df_weekly["scale_max"]              = scale_max     # keep for inverse transform
+
+# Sequential week index (t = 0, 1, 2, …) – the SIRS model's time variable
+df_weekly.insert(0, "t_week", np.arange(len(df_weekly)))
+
+print(f"\n  Smoothing: Savitzky-Golay (window={window_sg}, poly=3)")
+print(f"  Scale max: {scale_max:,.0f}")
+
+# ── Step 7 : Save PINN-ready CSV ─────────────────────────────────────────────
+df_weekly.to_csv(CLEAN_CSV)
+print(f"\n  Saved → {CLEAN_CSV}")
+print(f"  Columns: {df_weekly.columns.tolist()}")
+
+# ── Step 9 : Summary statistics ──────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 9 – Summary Statistics")
+print("=" * 65)
+
+n_weeks = len(df_weekly)
+total   = df_weekly["uk_cases_raw"].sum()
+peak    = df_weekly["uk_cases_raw"].max()
+peak_wk = df_weekly["uk_cases_raw"].idxmax()
+mean_v  = df_weekly["uk_cases_raw"].mean()
+med_v   = df_weekly["uk_cases_raw"].median()
+
+# Trend: split at peak
+pre_peak  = df_weekly.loc[:peak_wk, "uk_cases_raw"]
+post_peak = df_weekly.loc[peak_wk:, "uk_cases_raw"]
+pre_trend = np.polyfit(range(len(pre_peak)),  pre_peak.values,  1)[0]
+post_trend= np.polyfit(range(len(post_peak)), post_peak.values, 1)[0]
+
+print(f"  Total weeks       : {n_weeks}")
+print(f"  Total cases (sum) : {total:,.0f}")
+print(f"  Peak weekly cases : {peak:,.0f}  (week of {peak_wk.date()})")
+print(f"  Mean weekly cases : {mean_v:,.0f}")
+print(f"  Median            : {med_v:,.0f}")
+print(f"  Trend (pre-peak)  : +{pre_trend:,.0f} cases/week")
+print(f"  Trend (post-peak) : {post_trend:,.0f} cases/week")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STAGE 3  –  10 Professional Visualisation Charts
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("STAGE 3 – Generating 10 Visualisation Charts")
+print("=" * 65)
+
+# Shared style
+PALETTE = {
+    "raw"    : "#2196F3",
+    "smooth" : "#E91E63",
+    "fill"   : "#90CAF9",
+    "accent" : "#FF9800",
+    "dark"   : "#1A237E",
+    "green"  : "#43A047",
+    "purple" : "#7B1FA2",
+    "teal"   : "#00897B",
+    "red"    : "#E53935",
+    "grey"   : "#607D8B",
+}
+
+plt.rcParams.update({
+    "font.family"      : "DejaVu Sans",
+    "axes.spines.top"  : False,
+    "axes.spines.right": False,
+    "axes.grid"        : True,
+    "grid.alpha"       : 0.35,
+    "grid.linestyle"   : "--",
+    "figure.dpi"       : 140,
+    "figure.facecolor" : "white",
+    "axes.facecolor"   : "#F9FAFB",
+})
+
+weeks  = df_weekly.index
+raw_v  = df_weekly["uk_cases_raw"].values
+smo_v  = df_weekly["uk_cases_smooth"].values
+t      = df_weekly["t_week"].values
+
+def millions(x, pos):
+    if x >= 1e6: return f"{x/1e6:.1f}M"
+    if x >= 1e3: return f"{x/1e3:.0f}K"
+    return f"{x:.0f}"
+
+fmt = FuncFormatter(millions)
+
+# ── Chart 1 : Raw weekly cases ───────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(weeks, raw_v, alpha=0.25, color=PALETTE["fill"])
+ax.plot(weeks, raw_v, color=PALETTE["raw"], lw=1.5, label="Weekly raw cases")
+ax.axvline(peak_wk, color=PALETTE["red"], ls="--", lw=1.2,
+           label=f"Peak: {peak:,.0f} ({peak_wk.date()})")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+ax.yaxis.set_major_formatter(fmt)
+ax.set_title("Chart 1 – UK Weekly Raw Confirmed COVID-19 Cases",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("Date"); ax.set_ylabel("Weekly New Cases")
+ax.legend(framealpha=0.8)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_01_raw_weekly.png", bbox_inches="tight")
+plt.close(); print("  Chart 1 saved")
+
+# ── Chart 2 : Raw + Smooth overlay ───────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(weeks, raw_v, alpha=0.18, color=PALETTE["raw"])
+ax.plot(weeks, raw_v,  color=PALETTE["raw"],    lw=1.2, alpha=0.8, label="Raw")
+ax.plot(weeks, smo_v,  color=PALETTE["smooth"], lw=2.5, label="Smoothed (SG)")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+ax.yaxis.set_major_formatter(fmt)
+ax.set_title("Chart 2 – Raw vs Smoothed UK Weekly Cases",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("Date"); ax.set_ylabel("Weekly New Cases")
+ax.legend(framealpha=0.8)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_02_raw_vs_smooth.png", bbox_inches="tight")
+plt.close(); print("  Chart 2 saved")
+
+# ── Chart 3 : Log-scale dynamics ─────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.semilogy(weeks, np.clip(raw_v, 1, None),
+            color=PALETTE["raw"], lw=1.3, alpha=0.7, label="Raw (log)")
+ax.semilogy(weeks, np.clip(smo_v, 1, None),
+            color=PALETTE["smooth"], lw=2.2, label="Smooth (log)")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+ax.set_title("Chart 3 – Log-Scale Epidemic Dynamics",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("Date"); ax.set_ylabel("Weekly Cases (log)")
+ax.legend(framealpha=0.8)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_03_log_scale.png", bbox_inches="tight")
+plt.close(); print("  Chart 3 saved")
+
+# ── Chart 4 : PINN-ready scaled series ───────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(t, df_weekly["uk_cases_smooth_scaled"].values,
+                alpha=0.3, color=PALETTE["green"])
+ax.plot(t, df_weekly["uk_cases_raw_scaled"].values,
+        color=PALETTE["raw"], lw=1, alpha=0.6, label="Raw scaled")
+ax.plot(t, df_weekly["uk_cases_smooth_scaled"].values,
+        color=PALETTE["green"], lw=2.2, label="Smooth scaled [0-1]")
+ax.set_title("Chart 4 – PINN-Ready Normalised Incidence (0–1)",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("t (weeks)"); ax.set_ylabel("Normalised cases")
+ax.legend(framealpha=0.8)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_04_normalised.png", bbox_inches="tight")
+plt.close(); print("  Chart 4 saved")
+
+# ── Chart 5 : Annual breakdown (bar chart) ────────────────────────────────────
+annual = df_weekly["uk_cases_raw"].resample("YE").sum()
+years  = annual.index.year
+colors_bar = [PALETTE["teal"], PALETTE["purple"], PALETTE["accent"],
+              PALETTE["red"]][:len(years)]
+
+fig, ax = plt.subplots(figsize=(9, 5))
+bars = ax.bar(years, annual.values, color=colors_bar, edgecolor="white",
+              linewidth=1.2, width=0.6)
+for bar, val in zip(bars, annual.values):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + annual.max()*0.01,
+            f"{val/1e6:.2f}M", ha="center", va="bottom", fontsize=11,
+            fontweight="bold")
+ax.yaxis.set_major_formatter(fmt)
+ax.set_title("Chart 5 – Annual Total Confirmed Cases (UK)",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("Year"); ax.set_ylabel("Total Cases")
+ax.set_xticks(years)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_05_annual_bar.png", bbox_inches="tight")
+plt.close(); print("  Chart 5 saved")
+
+# ── Chart 6 : 4-wave heatmap (calendar style) ────────────────────────────────
+df_hm = df_weekly[["uk_cases_smooth"]].copy()
+df_hm["year"] = df_hm.index.year
+df_hm["week"] = df_hm.index.isocalendar().week.values
+pivot = df_hm.pivot_table(index="year", columns="week",
+                          values="uk_cases_smooth", aggfunc="sum")
+
+fig, ax = plt.subplots(figsize=(18, 4))
+im = ax.imshow(pivot.values, aspect="auto", cmap="YlOrRd",
+               interpolation="nearest")
+ax.set_yticks(range(len(pivot.index)))
+ax.set_yticklabels(pivot.index)
+ax.set_xlabel("ISO Week Number")
+ax.set_title("Chart 6 – Epidemic Heatmap: Year × Week",
+             fontsize=14, fontweight="bold", pad=12)
+fig.colorbar(im, ax=ax, label="Smoothed weekly cases", fraction=0.02)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_06_heatmap.png", bbox_inches="tight")
+plt.close(); print("  Chart 6 saved")
+
+# ── Chart 7 : 7-day rolling growth rate ──────────────────────────────────────
+growth = pd.Series(raw_v, index=weeks).pct_change() * 100
+growth_sm = gaussian_filter1d(growth.fillna(0).values, sigma=2)
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.axhline(0, color="black", lw=0.8, ls="-")
+ax.fill_between(weeks, growth_sm, where=growth_sm > 0,
+                color=PALETTE["red"],   alpha=0.45, label="Growth")
+ax.fill_between(weeks, growth_sm, where=growth_sm < 0,
+                color=PALETTE["green"], alpha=0.45, label="Decline")
+ax.plot(weeks, growth_sm, color=PALETTE["dark"], lw=1.2)
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+ax.set_ylim(-120, 160)
+ax.set_title("Chart 7 – Weekly Case Growth Rate (%)",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("Date"); ax.set_ylabel("% Change week-on-week")
+ax.legend(framealpha=0.8)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_07_growth_rate.png", bbox_inches="tight")
+plt.close(); print("  Chart 7 saved")
+
+# ── Chart 8 : Cumulative confirmed cases ─────────────────────────────────────
+cumsum = uk_cumulative.resample("W-MON").last().reindex(weeks, method="ffill")
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.fill_between(weeks, cumsum.values, alpha=0.25, color=PALETTE["purple"])
+ax.plot(weeks, cumsum.values, color=PALETTE["purple"], lw=2)
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+ax.yaxis.set_major_formatter(fmt)
+ax.set_title("Chart 8 – Cumulative Confirmed Cases (UK)",
+             fontsize=14, fontweight="bold", pad=12)
+ax.set_xlabel("Date"); ax.set_ylabel("Cumulative Cases")
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_08_cumulative.png", bbox_inches="tight")
+plt.close(); print("  Chart 8 saved")
+
+# ── Chart 9 : Distribution & box plots ───────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# Histogram
+axes[0].hist(raw_v[raw_v > 0], bins=40, color=PALETTE["teal"],
+             edgecolor="white", linewidth=0.6, density=True)
+axes[0].axvline(mean_v, color=PALETTE["red"],    lw=1.8, ls="--", label=f"Mean: {mean_v:,.0f}")
+axes[0].axvline(med_v,  color=PALETTE["accent"], lw=1.8, ls=":",  label=f"Median: {med_v:,.0f}")
+axes[0].xaxis.set_major_formatter(fmt)
+axes[0].set_title("Distribution of Weekly Cases", fontweight="bold")
+axes[0].set_xlabel("Weekly Cases"); axes[0].set_ylabel("Density")
+axes[0].legend(fontsize=9, framealpha=0.8)
+
+# Box plot by year
+years_list = sorted(df_weekly.index.year.unique())
+data_by_year = [df_weekly.loc[df_weekly.index.year == y, "uk_cases_raw"].values
+                for y in years_list]
+bp = axes[1].boxplot(data_by_year, patch_artist=True,
+                     medianprops=dict(color="white", lw=2))
+year_colors = [PALETTE["teal"], PALETTE["purple"], PALETTE["accent"], PALETTE["red"]]
+for patch, col in zip(bp["boxes"], year_colors[:len(years_list)]):
+    patch.set_facecolor(col); patch.set_alpha(0.75)
+axes[1].set_xticklabels(years_list)
+axes[1].yaxis.set_major_formatter(fmt)
+axes[1].set_title("Box Plot: Weekly Cases by Year", fontweight="bold")
+axes[1].set_xlabel("Year"); axes[1].set_ylabel("Weekly Cases")
+
+fig.suptitle("Chart 9 – Statistical Distribution of UK Weekly Cases",
+             fontsize=14, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}chart_09_distribution.png", bbox_inches="tight")
+plt.close(); print("  Chart 9 saved")
+
+# ── Chart 10 : Dashboard summary (6-panel) ───────────────────────────────────
+fig = plt.figure(figsize=(18, 11))
+fig.suptitle("Chart 10 – UK COVID-19 Data Dashboard\n"
+             "SIRS Model: Parameter Estimation & Uncertainty Analysis",
+             fontsize=15, fontweight="bold", y=0.99)
+gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+# Panel A – Raw + smooth
+ax_a = fig.add_subplot(gs[0, :2])
+ax_a.fill_between(weeks, raw_v, alpha=0.18, color=PALETTE["raw"])
+ax_a.plot(weeks, raw_v,  color=PALETTE["raw"],    lw=1.2, alpha=0.7, label="Raw")
+ax_a.plot(weeks, smo_v,  color=PALETTE["smooth"], lw=2.2, label="Smooth")
+ax_a.axvline(peak_wk, color=PALETTE["red"], ls="--", lw=1, alpha=0.7)
+ax_a.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+ax_a.yaxis.set_major_formatter(fmt)
+ax_a.set_title("A  Weekly Incidence (Raw & Smooth)", fontweight="bold")
+ax_a.legend(fontsize=9, framealpha=0.8)
+
+# Panel B – Annual bar
+ax_b = fig.add_subplot(gs[0, 2])
+ax_b.bar(years, annual.values, color=colors_bar, edgecolor="white",
+         linewidth=1, width=0.6)
+ax_b.yaxis.set_major_formatter(fmt)
+ax_b.set_title("B  Annual Totals", fontweight="bold")
+ax_b.set_xticks(years); ax_b.set_xticklabels(years, fontsize=9)
+
+# Panel C – Normalised
+ax_c = fig.add_subplot(gs[1, 0])
+ax_c.fill_between(t, df_weekly["uk_cases_smooth_scaled"].values,
+                  alpha=0.4, color=PALETTE["green"])
+ax_c.plot(t, df_weekly["uk_cases_smooth_scaled"].values,
+          color=PALETTE["green"], lw=2)
+ax_c.set_title("C  Normalised (PINN input)", fontweight="bold")
+ax_c.set_xlabel("t (weeks)"); ax_c.set_ylabel("I(t) normalised")
+
+# Panel D – Growth rate
+ax_d = fig.add_subplot(gs[1, 1])
+ax_d.fill_between(weeks, growth_sm, where=growth_sm > 0,
+                  color=PALETTE["red"],   alpha=0.5)
+ax_d.fill_between(weeks, growth_sm, where=growth_sm < 0,
+                  color=PALETTE["green"], alpha=0.5)
+ax_d.axhline(0, color="black", lw=0.8)
+ax_d.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax_d.set_ylim(-120, 160)
+ax_d.set_title("D  Growth Rate (%/week)", fontweight="bold")
+
+# Panel E – Cumulative
+ax_e = fig.add_subplot(gs[1, 2])
+ax_e.fill_between(weeks, cumsum.values, alpha=0.3, color=PALETTE["purple"])
+ax_e.plot(weeks, cumsum.values, color=PALETTE["purple"], lw=1.8)
+ax_e.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax_e.yaxis.set_major_formatter(fmt)
+ax_e.set_title("E  Cumulative Cases", fontweight="bold")
+
+plt.savefig(f"{CHART_DIR}chart_10_dashboard.png", bbox_inches="tight")
+plt.close(); print("  Chart 10 saved")
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("ALL DONE")
+print("=" * 65)
+print(f"  Clean CSV  → {CLEAN_CSV}")
+print(f"  Charts 1-10 → {CHART_DIR}chart_01 … chart_10_*.png")
+print(f"\n  Dataset shape : {df_weekly.shape}")
+print(f"  Columns       : {df_weekly.columns.tolist()}")
+print(f"\n  ── Summary ──")
+print(f"  Weeks        : {n_weeks}")
+print(f"  Total cases  : {total:,.0f}")
+print(f"  Peak         : {peak:,.0f}  ({peak_wk.date()})")
+print(f"  Mean / week  : {mean_v:,.0f}")
+print(f"  Median/week  : {med_v:,.0f}")
+print(f"  Pre-peak trend  : +{pre_trend:,.0f} cases/week")
+print(f"  Post-peak trend : {post_trend:,.0f} cases/week")
+print("=" * 65)
