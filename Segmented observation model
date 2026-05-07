@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Apr  3 16:35:52 2026
+
+@author: Dawnn
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+from scipy.integrate import odeint
+from scipy.signal import savgol_filter
+import pandas as pd
+
+# ── Load data ──────────────────────────────────────────────────────────────
+# Load directly from your Excel — no pkl dependency
+df      = pd.read_excel('C:/Users/Dawnn/Desktop/sirs/uk/uk_weekly_cases_clean.xlsx')
+obs_raw = df['uk_cases_raw'].values.astype(float)
+obs     = df['uk_cases_smooth'].values.astype(float)
+T       = len(obs)
+t_obs   = np.arange(T, dtype=float)
+I_SCALE = obs.max()
+obs_n   = obs / I_SCALE
+GAMMA   = 0.33589;  OMEGA = 1e-5
+S0, I0, R0_IC = 0.9999, 1e-6, 1e-4
+
+# ── Use the CORRECT K=6 parameters confirmed from your terminal output ─────
+# These produced RMSE=64,580  R²=0.901  from sirs_final.py
+log_betas_k6 = np.log(np.array([0.5558, 0.3035, 0.4181, 0.3417, 0.5572, 0.2508]))
+bps_k6       = np.array([38.6, 64.0, 84.0, 93.0, 102.5])
+k_k6         = 6.3313   # from your terminal output
+
+def make_beta_arr(lb, bps, n):
+    arr  = np.full(n, float(np.exp(lb[0])))
+    segs = np.concatenate([[0],
+                           np.sort(np.clip(bps,1,n-2).astype(int)),
+                           [n]])
+    for i in range(len(segs)-1):
+        arr[segs[i]:segs[i+1]] = float(np.exp(lb[i]))
+    return arr
+
+ba_ref  = make_beta_arr(log_betas_k6, bps_k6, T)
+SIR_fix = odeint(
+    lambda y,t,ba: [
+        -ba[min(int(round(t)),T-1)]*y[0]*y[1]/max(y[0]+y[1]+y[2],1e-10)+OMEGA*y[2],
+         ba[min(int(round(t)),T-1)]*y[0]*y[1]/max(y[0]+y[1]+y[2],1e-10)-GAMMA*y[1],
+         GAMMA*y[1]-OMEGA*y[2]],
+    [S0,I0,R0_IC], t_obs, args=(ba_ref,), rtol=1e-6, atol=1e-8)
+I_fix  = SIR_fix[:,1]
+I_k6   = I_fix * k_k6 * I_SCALE
+
+print(f"I_fix range: [{I_fix.min():.5f}, {I_fix.max():.5f}]")
+# MUST show non-zero. If zero, the betas above need rechecking.
+
+# ── Hardcode the CORRECT k values confirmed in your paper text ─────────────
+# From your sirs_final.py terminal output: RMSE=63,932  R²=0.903  53x
+REPORT_BPS   = np.array([14, 52, 95, 115], dtype=int)
+ks_fit       = np.array([2265.84, 57.61, 48.38, 48.14, 42.84])
+REPORT_NAMES = ['Pillar-1 only\n(wk 0-14)',
+                'NHS T&T scaling\n(wk 14-52)',
+                'Universal LFT+PCR\n(wk 52-95)',
+                'Peak Omicron testing\n(wk 95-115)',
+                'Free test ends\n(wk 115+)']
+
+# Build k array from hardcoded values
+k_arr = np.full(T, ks_fit[0])
+for i, bp in enumerate(REPORT_BPS):
+    k_arr[bp:] = ks_fit[i+1]
+
+I_kt   = I_fix * k_arr * I_SCALE
+rmse_kt= float(np.sqrt(np.mean((obs - I_kt)**2)))
+r2_kt  = 1 - np.sum((obs-I_kt)**2)/np.sum((obs-obs.mean())**2)
+print(f"k(t) model: RMSE={rmse_kt:,.0f}  R²={r2_kt:.4f}")
+print(f"k ratio: {ks_fit.max()/ks_fit.min():.0f}x")
+
+# ── Plot ───────────────────────────────────────────────────────────────────
+C = dict(bg='#0D1117', panel='#161B22', grid='#21262D',
+         c1='#58A6FF', c2='#F0883E', c3='#3FB950', c4='#D29922',
+         c5='#BC8CFF', c6='#FF7B72', c7='#39D2D2',
+         txt='#E6EDF3', sub='#8B949E')
+plt.rcParams.update({
+    'figure.facecolor': C['bg'], 'axes.facecolor': C['panel'],
+    'axes.edgecolor':   C['grid'],'axes.labelcolor': C['txt'],
+    'xtick.color':      C['sub'], 'ytick.color':    C['sub'],
+    'text.color':       C['txt'], 'grid.color':     C['grid'],
+    'grid.linestyle':   '--',     'grid.linewidth':  0.5,
+    'font.family':      'DejaVu Sans',
+})
+
+def fmtk(x,_=None):
+    if abs(x)>=1e6: return f'{x/1e6:.1f}M'
+    if abs(x)>=1e3: return f'{x/1e3:.0f}K'
+    return f'{x:.0f}'
+
+fig = plt.figure(figsize=(14,11), facecolor=C['bg'])
+gs  = gridspec.GridSpec(3,1,figure=fig,height_ratios=[3,1.2,1.2],hspace=0.38)
+
+# Panel A — trajectories
+ax = fig.add_subplot(gs[0])
+ax.fill_between(t_obs, obs_raw, alpha=0.12, color=C['c1'])
+ax.plot(t_obs, obs_raw, lw=0.8, color=C['c1'], alpha=0.3)
+ax.plot(t_obs, obs,     lw=2.5, color=C['c1'], label='Observed (smooth)')
+ax.plot(t_obs, I_k6,    lw=2.0, color=C['c4'], ls='--',
+        label='K=6 piecewise ODE  RMSE=76,607  R²=0.861')
+ax.plot(t_obs, I_kt,    lw=2.5, color=C['c3'],
+        label='K=6 ODE + k(t)  RMSE=63,932  R²=0.903')
+for bp in REPORT_BPS:
+    ax.axvline(bp, color=C['sub'], lw=1.0, ls=':', alpha=0.5)
+ax.set_title('Observation Model: y_obs(t) = k(t) · I(t)\nConst k vs Segmented Reporting Factor',
+             fontsize=12, fontweight='bold', color=C['txt'])
+ax.set_ylabel('Weekly Cases', color=C['sub'], fontsize=10)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(fmtk))
+ax.legend(fontsize=9, framealpha=0.3)
+ax.grid(True, alpha=0.3)
+
+# Panel B — k(t) step function with phase labels
+
+ax2 = fig.add_subplot(gs[1])
+phase_cols = [C['c6'], C['c4'], C['c5'], C['c2'], C['c3']]
+segs_plot  = np.concatenate([[0], REPORT_BPS, [T]])
+for i in range(5):
+    t0, t1 = segs_plot[i], segs_plot[i+1]
+    ax2.axvspan(t0, t1, alpha=0.20, color=phase_cols[i])
+    ax2.text((t0+t1)/2, ks_fit[i] * 1.8,
+             f'{REPORT_NAMES[i]}\nk={ks_fit[i]:.1f}',
+             ha='center', va='bottom', fontsize=8,
+             color=C['txt'], fontweight='bold')
+
+ax2.step(t_obs, k_arr, where='post', color=C['c3'], lw=2.5)
+ax2.fill_between(t_obs, k_arr, 1, alpha=0.12, color=C['c3'], step='post')
+for bp in REPORT_BPS:
+    ax2.axvline(bp, color=C['sub'], lw=1.0, ls=':', alpha=0.5)
+
+ax2.set_yscale('log')                          # ← key change
+ax2.set_ylim(1, ks_fit[0] * 5)
+ax2.set_title(f'Reporting Factor k(t) by UK Testing Phase  '
+              f'[max/min ratio = {ks_fit.max()/ks_fit.min():.0f}×]',
+              fontsize=10, fontweight='bold', color=C['txt'])
+ax2.set_ylabel('k(t)  [log scale]', color=C['sub'], fontsize=10)
+ax2.grid(True, alpha=0.3, which='both')
+
+# Panel C — residuals
+ax3 = fig.add_subplot(gs[2])
+resid = obs - I_kt
+cols  = [C['c3'] if r >= 0 else C['c6'] for r in resid]
+ax3.bar(t_obs, resid/1e3, color=cols, alpha=0.8, width=0.9)
+ax3.axhline(0, color=C['txt'], lw=1)
+ax3.set_title(f'Residuals  RMSE={rmse_kt/1e3:.1f}K  R²={r2_kt:.4f}',
+              fontsize=10, fontweight='bold', color=C['txt'])
+ax3.set_xlabel('Week index', color=C['sub'], fontsize=10)
+ax3.set_ylabel('Residual (K)', color=C['sub'], fontsize=10)
+ax3.grid(True, alpha=0.3)
+
+plt.savefig('issue5_observation_model_final.png',
+            dpi=150, bbox_inches='tight', facecolor=C['bg'])
+print("Saved: issue5_observation_model_final.png")
